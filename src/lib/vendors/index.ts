@@ -25,3 +25,4 @@ export type {
   VendorCredentials,
   VendorId,
 } from "./types";
+export { hasLiveSolarmanCredentials } from "./types";

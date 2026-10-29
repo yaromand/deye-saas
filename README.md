@@ -4,90 +4,96 @@
 
 Стек: **Next.js (App Router) + TypeScript + Postgres (Drizzle) + Redis (BullMQ)**.
 
-## Что уже есть (фаза 1 — scaffold)
+## Статус фаз
 
-- Регистрация / логин (session cookie, роли `admin` | `client`)
-- Маршруты клиента: дашборд, инверторы, Telegram (заглушки UI)
-- Маршрут админа: пользователи (заглушка)
-- Схема БД: users, vendor_accounts, inverters, telemetry_points, alert_*, telegram_*, broadcasts
-- Redis-клиент и entrypoint воркеров polling / Telegram (stubs)
-- Интерфейс vendor adapter + stub Solarman/Deye
-- `docker-compose` для Postgres + Redis
-
-Полный polling API, графики и живой Telegram — в следующих фазах.
-
-## Требования
-
-- Node.js 20+
-- Docker (для Postgres и Redis)
+| Фаза | Содержание | Статус |
+|------|------------|--------|
+| 1 — Scaffold | Auth, роли, layouts, схема БД | ✅ |
+| 2 — Ingest | Solarman/Deye adapter, polling, telemetry API/UI | ✅ (этот PR) |
+| 3 — UI polish / admin | Расширенные графики, админ CRUD | later |
+| 4 — Telegram | Бот, алерты, broadcasts | later |
 
 ## Быстрый старт
 
 ```bash
-# 1. Инфраструктура
 docker compose up -d
-
-# 2. Переменные окружения
 cp .env.example .env
-# при необходимости отредактируйте AUTH_SECRET и ENCRYPTION_KEY
-
-# 3. Зависимости
+# задайте AUTH_SECRET (≥32) и ENCRYPTION_KEY (≥16)
 npm install
-
-# 4. Миграции Drizzle
 npm run db:migrate
-
-# 5. Веб-приложение
-npm run dev
-
-# 6. (опционально) воркеры в отдельном терминале
-npm run worker
+npm run dev          # http://localhost:3000
+npm run worker       # отдельный терминал: polling + Telegram stubs
 ```
 
-Откройте [http://localhost:3000](http://localhost:3000).
+## Solarman / Deye credentials
 
-## Скрипты
+Официальная документация: [Solarman OpenAPI](https://doc.solarmanpv.com/en/Documentation%20and%20Quick%20Guide).
 
-| Команда | Назначение |
-|---------|------------|
-| `npm run dev` | Next.js в режиме разработки |
-| `npm run build` / `npm start` | production-сборка и запуск |
-| `npm run worker` | BullMQ workers (polling + Telegram stubs) |
-| `npm run db:generate` | сгенерировать SQL-миграции из схемы |
-| `npm run db:migrate` | применить миграции |
-| `npm run db:studio` | Drizzle Studio |
-| `npm run lint` | ESLint |
+Deye Cloud обычно ходит в **тот же** Solarman Open API.
 
-## Структура
+### Базовые URL
 
-```
-src/app/(auth)       — login / register
-src/app/(client)     — dashboard, inverters, telegram
-src/app/(admin)      — admin/users
-src/lib/db           — Drizzle schema + client
-src/lib/auth         — session (iron-session) + password
-src/lib/vendors      — VendorAdapter + Solarman/Deye stub
-src/lib/redis.ts     — Redis client
-workers/             — polling.ts, telegram.ts, index.ts
-drizzle/             — SQL-миграции
-docker-compose.yml   — Postgres 16 + Redis 7
-```
+| Дата-центр | URL |
+|------------|-----|
+| International (по умолчанию) | `https://globalapi.solarmanpv.com` |
+| China | `https://api.solarmanpv.com` |
+
+### Поля (форма «Инверторы» / `vendor_accounts.credentials`)
+
+| Поле | Обязательно | Описание |
+|------|-------------|----------|
+| `appId` | да* | APP ID приложения Open Platform |
+| `appSecret` | да* | APP Secret |
+| `password` | да* | Пароль аккаунта Solarman (хранится encrypted; в token-запросе — SHA-256) |
+| `email` / `username` / `mobile` | да* (одно из) | Логин аккаунта |
+| `accessToken` | нет | Если задан — логин пропускается |
+| `baseUrl` | нет | Переопределение API host |
+| `stationId` | нет | Ограничить discovery одной станцией |
+| `orgId` | нет | Merchant / company ID |
+| `countryCode` | нет | Нужен при логине по `mobile` |
+
+\* Без полного набора адаптер **не ходит в сеть** и отдаёт stub-метрики (удобно для локальной разработки). Секреты в репозиторий не кладём.
+
+### Используемые API
+
+1. `POST /account/v1.0/token?appId=` — OAuth-like token (password = SHA-256)
+2. `POST /station/v1.0/list` — список станций
+3. `POST /station/v1.0/device` — устройства станции (`deviceType: INVERTER`)
+4. `POST /device/v1.0/list` — fallback-список устройств
+5. `POST /device/v1.0/currentData` — realtime (`deviceSn`)
+6. `POST /device/v1.0/historical` — история для графиков
+
+Как получить APP ID/Secret: заявка в Solarman Open Platform (см. Quick Guide / `service@solarmanpv.com`).
+
+## API клиента (tenant из сессии)
+
+| Метод | Путь | Назначение |
+|-------|------|------------|
+| GET/POST | `/api/vendor-accounts` | Список / добавить аккаунт |
+| DELETE | `/api/vendor-accounts/:id` | Удалить |
+| GET/POST | `/api/inverters` | Список / добавить или `discover: true` |
+| DELETE | `/api/inverters/:id` | Удалить |
+| POST | `/api/inverters/:id/sync` | Опрос одного + enqueue BullMQ |
+| POST | `/api/inverters/sync` | Опрос всех инверторов тенанта |
+| GET | `/api/inverters/:id/metrics?from=&to=` | Точки для графика/таблицы |
+
+## Воркер
+
+`npm run worker` поднимает BullMQ consumer `poll-inverter` и раз в `POLL_INTERVAL_MS` (по умолчанию 5 мин) ставит jobs на все активные инверторы. UI Sync работает и **без** worker (inline poll).
 
 ## Мультитенантность
 
-На MVP **один пользователь = один тенант** (`tenant_id === user.id`). Все бизнес-таблицы несут `tenant_id`; API берёт его только из сессии, не из тела запроса.
+`tenant_id === user.id` на MVP. API никогда не принимает чужой `tenant_id` из тела — только из сессии. Секреты вендоров: AES-GCM (`ENCRYPTION_KEY`).
 
 ## Админ
-
-Первого администратора пока нужно создать вручную (обновить `role` в таблице `users` на `admin` после регистрации) — CRUD админки появится в фазе 3.
 
 ```sql
 UPDATE users SET role = 'admin' WHERE email = 'you@example.com';
 ```
 
-## Безопасность
+## Известные ограничения
 
-- Пароли: bcrypt
-- Сессия: httpOnly cookie (`AUTH_SECRET`)
-- Секреты вендоров и Telegram: at-rest AES-GCM (`ENCRYPTION_KEY`)
-- Реальные vendor/Telegram токены в репозиторий не кладём
+- **Felicity** — адаптер не реализован (нет стабильной публичной доки в срок MVP).
+- Ключи realtime (`Pac`, `Etdy_ge1`, …) зависят от point table устройства; парсер покрывает типичные имена.
+- Rate limits Solarman: не крутите polling чаще 1–5 мин на устройство.
+- Токен Solarman живёт ~60 дней; refresh flow — later.
