@@ -1,0 +1,36 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: deye-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: deye
+      POSTGRES_PASSWORD: deye
+      POSTGRES_DB: deye
+    ports:
+      - "5432:5432"
+    volumes:
+      - deye_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U deye -d deye"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: deye-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - deye_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  deye_pg_data:
+  deye_redis_data:
