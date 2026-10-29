@@ -1,7 +1,7 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
-import { MetricsSparkline } from "./metrics-sparkline";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { MetricsChart, StatusBadge } from "./metrics-chart";
 
 type Account = {
   id: string;
@@ -37,6 +37,15 @@ type AdapterInfo = {
   };
 };
 
+type RangeKey = "1h" | "6h" | "24h" | "7d";
+
+const RANGES: { key: RangeKey; label: string; ms: number }[] = [
+  { key: "1h", label: "1 ч", ms: 60 * 60 * 1000 },
+  { key: "6h", label: "6 ч", ms: 6 * 60 * 60 * 1000 },
+  { key: "24h", label: "24 ч", ms: 24 * 60 * 60 * 1000 },
+  { key: "7d", label: "7 дн", ms: 7 * 24 * 60 * 60 * 1000 },
+];
+
 const emptyCreds = {
   appId: "",
   appSecret: "",
@@ -55,7 +64,13 @@ export function InvertersPanel({ adapters }: { adapters: AdapterInfo[] }) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [points, setPoints] = useState<MetricPoint[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [info, setInfo] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [syncingId, setSyncingId] = useState<string | null>(null);
+  const [loadState, setLoadState] = useState<"loading" | "ok" | "error">(
+    "loading",
+  );
+  const [range, setRange] = useState<RangeKey>("24h");
   const [vendor, setVendor] = useState<"solarman" | "deye">("solarman");
   const [label, setLabel] = useState("");
   const [creds, setCreds] = useState(emptyCreds);
@@ -64,44 +79,77 @@ export function InvertersPanel({ adapters }: { adapters: AdapterInfo[] }) {
   const [manualAccountId, setManualAccountId] = useState("");
 
   const activeAdapter = adapters.find((a) => a.id === vendor);
+  const selected = inverters.find((i) => i.id === selectedId) ?? null;
 
   const refresh = useCallback(async () => {
-    const [aRes, iRes] = await Promise.all([
-      fetch("/api/vendor-accounts"),
-      fetch("/api/inverters"),
-    ]);
-    if (!aRes.ok || !iRes.ok) {
-      setError("Не удалось загрузить данные (нужна авторизация и БД)");
-      return;
+    setLoadState("loading");
+    try {
+      const [aRes, iRes] = await Promise.all([
+        fetch("/api/vendor-accounts"),
+        fetch("/api/inverters"),
+      ]);
+      if (!aRes.ok || !iRes.ok) {
+        setError("Не удалось загрузить данные (нужна авторизация и БД)");
+        setLoadState("error");
+        return;
+      }
+      const aJson = await aRes.json();
+      const iJson = await iRes.json();
+      setAccounts(aJson.accounts ?? []);
+      setInverters(iJson.inverters ?? []);
+      setManualAccountId((prev) => prev || aJson.accounts?.[0]?.id || "");
+      setLoadState("ok");
+      setError(null);
+    } catch {
+      setError("Сеть недоступна");
+      setLoadState("error");
     }
-    const aJson = await aRes.json();
-    const iJson = await iRes.json();
-    setAccounts(aJson.accounts ?? []);
-    setInverters(iJson.inverters ?? []);
-    if (!manualAccountId && aJson.accounts?.[0]?.id) {
-      setManualAccountId(aJson.accounts[0].id);
-    }
-  }, [manualAccountId]);
-
-  const loadMetrics = useCallback(async (id: string) => {
-    const res = await fetch(`/api/inverters/${id}/metrics?limit=200`);
-    if (!res.ok) return;
-    const json = await res.json();
-    setPoints(json.points ?? []);
   }, []);
+
+  const loadMetrics = useCallback(
+    async (id: string, rangeKey: RangeKey) => {
+      const ms = RANGES.find((r) => r.key === rangeKey)?.ms ?? RANGES[2].ms;
+      const to = new Date();
+      const from = new Date(to.getTime() - ms);
+      const res = await fetch(
+        `/api/inverters/${id}/metrics?from=${from.toISOString()}&to=${to.toISOString()}&limit=1000`,
+      );
+      if (!res.ok) {
+        setPoints([]);
+        return;
+      }
+      const json = await res.json();
+      setPoints(json.points ?? []);
+    },
+    [],
+  );
 
   useEffect(() => {
     void refresh();
   }, [refresh]);
 
   useEffect(() => {
-    if (selectedId) void loadMetrics(selectedId);
-  }, [selectedId, loadMetrics]);
+    if (selectedId) void loadMetrics(selectedId, range);
+  }, [selectedId, range, loadMetrics]);
+
+  const chartLabels = useMemo(
+    () =>
+      points.map((p) =>
+        new Date(p.ts).toLocaleString("ru-RU", {
+          day: "2-digit",
+          month: "2-digit",
+          hour: "2-digit",
+          minute: "2-digit",
+        }),
+      ),
+    [points],
+  );
 
   async function addAccount(e: React.FormEvent) {
     e.preventDefault();
     setBusy(true);
     setError(null);
+    setInfo(null);
     try {
       const res = await fetch("/api/vendor-accounts", {
         method: "POST",
@@ -119,6 +167,7 @@ export function InvertersPanel({ adapters }: { adapters: AdapterInfo[] }) {
       }
       setCreds(emptyCreds);
       setLabel("");
+      setInfo("Аккаунт вендора сохранён");
       await refresh();
     } finally {
       setBusy(false);
@@ -139,6 +188,7 @@ export function InvertersPanel({ adapters }: { adapters: AdapterInfo[] }) {
   async function discover(accountId: string) {
     setBusy(true);
     setError(null);
+    setInfo(null);
     try {
       const res = await fetch("/api/inverters", {
         method: "POST",
@@ -150,6 +200,9 @@ export function InvertersPanel({ adapters }: { adapters: AdapterInfo[] }) {
         setError(data.error ?? "Ошибка discovery");
         return;
       }
+      setInfo(
+        `Найдено устройств: ${data.discovered ?? 0}, обновлено: ${(data.created ?? []).length}`,
+      );
       await refresh();
     } finally {
       setBusy(false);
@@ -178,33 +231,45 @@ export function InvertersPanel({ adapters }: { adapters: AdapterInfo[] }) {
       }
       setManualSn("");
       setManualName("");
+      setInfo("Инвертор добавлен");
       await refresh();
+      if (data.inverter?.id) setSelectedId(data.inverter.id);
     } finally {
       setBusy(false);
     }
   }
 
   async function syncOne(id: string) {
-    setBusy(true);
+    setSyncingId(id);
     setError(null);
+    setInfo(null);
     try {
       const res = await fetch(`/api/inverters/${id}/sync`, { method: "POST" });
       const data = await res.json();
-      if (!res.ok) {
-        setError(data.error ?? data.result?.error ?? "Ошибка sync");
+      if (!res.ok || data.result?.ok === false) {
+        setError(
+          data.error ?? data.result?.error ?? "Ошибка синхронизации",
+        );
         return;
       }
+      const r = data.result;
+      setInfo(
+        `Sync OK: ${r.status ?? "—"}${r.powerW != null ? `, ${Math.round(r.powerW)} Вт` : ""}${r.stub ? " (stub)" : ""}`,
+      );
       await refresh();
-      await loadMetrics(id);
       setSelectedId(id);
+      await loadMetrics(id, range);
+    } catch {
+      setError("Сеть недоступна при sync");
     } finally {
-      setBusy(false);
+      setSyncingId(null);
     }
   }
 
   async function syncAll() {
     setBusy(true);
     setError(null);
+    setInfo(null);
     try {
       const res = await fetch("/api/inverters/sync", { method: "POST" });
       const data = await res.json();
@@ -212,8 +277,11 @@ export function InvertersPanel({ adapters }: { adapters: AdapterInfo[] }) {
         setError(data.error ?? "Ошибка sync");
         return;
       }
+      const results = data.results ?? [];
+      const ok = results.filter((r: { ok: boolean }) => r.ok).length;
+      setInfo(`Синхронизировано: ${ok}/${results.length}`);
       await refresh();
-      if (selectedId) await loadMetrics(selectedId);
+      if (selectedId) await loadMetrics(selectedId, range);
     } finally {
       setBusy(false);
     }
@@ -234,15 +302,16 @@ export function InvertersPanel({ adapters }: { adapters: AdapterInfo[] }) {
     }
   }
 
-  const powerSeries = points
-    .map((p) => p.powerW)
-    .filter((v): v is number => v != null);
-
   return (
     <div className="flex flex-col gap-8">
       {error && (
         <p className="rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
           {error}
+        </p>
+      )}
+      {info && (
+        <p className="rounded border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-800">
+          {info}
         </p>
       )}
 
@@ -252,7 +321,7 @@ export function InvertersPanel({ adapters }: { adapters: AdapterInfo[] }) {
         </h2>
         <p className="mt-1 text-sm text-zinc-600">
           Секреты шифруются at-rest (`ENCRYPTION_KEY`). Без полного набора
-          полей адаптер работает в stub-режиме (синтетические метрики).
+          полей — stub-метрики.
         </p>
         {activeAdapter && (
           <p className="mt-2 text-xs text-zinc-500">
@@ -288,18 +357,20 @@ export function InvertersPanel({ adapters }: { adapters: AdapterInfo[] }) {
               ["appSecret", "App Secret"],
               ["email", "Email аккаунта"],
               ["username", "Username (если нет email)"],
-              ["password", "Пароль (хранится encrypted; в API — SHA-256)"],
-              ["accessToken", "Access token (опционально, вместо логина)"],
-              ["baseUrl", "Base URL (по умолчанию globalapi.solarmanpv.com)"],
-              ["stationId", "Station ID (опционально)"],
-              ["orgId", "Org / company ID (опционально)"],
+              ["password", "Пароль"],
+              ["accessToken", "Access token (опционально)"],
+              ["baseUrl", "Base URL"],
+              ["stationId", "Station ID"],
+              ["orgId", "Org ID"],
             ] as const
           ).map(([key, title]) => (
-            <label key={key} className="flex flex-col gap-1 text-sm sm:col-span-1">
+            <label key={key} className="flex flex-col gap-1 text-sm">
               <span className="text-zinc-600">{title}</span>
               <input
                 type={
-                  key === "password" || key === "appSecret" || key === "accessToken"
+                  key === "password" ||
+                  key === "appSecret" ||
+                  key === "accessToken"
                     ? "password"
                     : "text"
                 }
@@ -363,19 +434,16 @@ export function InvertersPanel({ adapters }: { adapters: AdapterInfo[] }) {
           <h2 className="text-base font-semibold text-zinc-900">Инверторы</h2>
           <button
             type="button"
-            disabled={busy || !inverters.length}
+            disabled={busy || !inverters.length || syncingId != null}
             onClick={syncAll}
             className="rounded bg-emerald-700 px-3 py-1.5 text-sm text-white hover:bg-emerald-800 disabled:opacity-60"
           >
-            Синхронизировать все
+            {busy ? "Синхронизация…" : "Синхронизировать все"}
           </button>
         </div>
 
-        <form
-          onSubmit={addManual}
-          className="mt-4 grid gap-3 sm:grid-cols-4"
-        >
-          <label className="flex flex-col gap-1 text-sm sm:col-span-1">
+        <form onSubmit={addManual} className="mt-4 grid gap-3 sm:grid-cols-4">
+          <label className="flex flex-col gap-1 text-sm">
             <span className="text-zinc-600">Аккаунт</span>
             <select
               className="rounded border border-zinc-300 px-3 py-2"
@@ -420,10 +488,22 @@ export function InvertersPanel({ adapters }: { adapters: AdapterInfo[] }) {
           </div>
         </form>
 
+        {loadState === "loading" && (
+          <p className="mt-4 text-sm text-zinc-500">Загрузка…</p>
+        )}
+        {loadState === "error" && !inverters.length && (
+          <p className="mt-4 rounded border border-dashed border-zinc-300 bg-zinc-50 px-3 py-6 text-center text-sm text-zinc-500">
+            Не удалось загрузить список. Проверьте сессию и DATABASE_URL.
+          </p>
+        )}
+        {loadState === "ok" && inverters.length === 0 && (
+          <p className="mt-4 rounded border border-dashed border-zinc-300 bg-zinc-50 px-3 py-6 text-center text-sm text-zinc-500">
+            Пока нет инверторов — сохраните аккаунт вендора и нажмите «Найти
+            устройства» или добавьте SN вручную.
+          </p>
+        )}
+
         <ul className="mt-4 divide-y divide-zinc-100 text-sm">
-          {inverters.length === 0 && (
-            <li className="py-3 text-zinc-500">Пока нет инверторов</li>
-          )}
           {inverters.map((inv) => (
             <li
               key={inv.id}
@@ -436,22 +516,25 @@ export function InvertersPanel({ adapters }: { adapters: AdapterInfo[] }) {
                 className="text-left"
                 onClick={() => setSelectedId(inv.id)}
               >
-                <span className="font-medium text-zinc-900">{inv.name}</span>
+                <span className="flex items-center gap-2 font-medium text-zinc-900">
+                  {inv.name}
+                  <StatusBadge status={inv.status} />
+                </span>
                 <span className="mt-0.5 block text-xs text-zinc-500">
-                  {inv.externalDeviceId} · {inv.vendor} · {inv.status}
+                  {inv.externalDeviceId} · {inv.vendor}
                   {inv.lastSeenAt
                     ? ` · ${new Date(inv.lastSeenAt).toLocaleString("ru-RU")}`
-                    : ""}
+                    : " · ещё не синхронизирован"}
                 </span>
               </button>
               <div className="flex gap-2">
                 <button
                   type="button"
-                  disabled={busy}
+                  disabled={busy || syncingId != null}
                   onClick={() => syncOne(inv.id)}
-                  className="rounded border border-zinc-300 px-2 py-1 hover:bg-zinc-50"
+                  className="rounded border border-zinc-300 px-2 py-1 hover:bg-zinc-50 disabled:opacity-60"
                 >
-                  Sync
+                  {syncingId === inv.id ? "Sync…" : "Sync"}
                 </button>
                 <button
                   type="button"
@@ -467,18 +550,71 @@ export function InvertersPanel({ adapters }: { adapters: AdapterInfo[] }) {
         </ul>
       </section>
 
-      {selectedId && (
+      {selected && (
         <section className="rounded-lg border border-zinc-200 bg-white p-5">
-          <h2 className="text-base font-semibold text-zinc-900">
-            Метрики (мощность)
-          </h2>
-          <p className="mt-1 text-sm text-zinc-500">
-            Последние точки из `telemetry_points` (после Sync или worker).
-          </p>
-          <div className="mt-4">
-            <MetricsSparkline values={powerSeries} />
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <h2 className="text-base font-semibold text-zinc-900">
+                {selected.name}
+              </h2>
+              <p className="mt-1 text-sm text-zinc-500">
+                SN {selected.externalDeviceId} · <StatusBadge status={selected.status} />
+              </p>
+            </div>
+            <div className="flex flex-wrap gap-1">
+              {RANGES.map((r) => (
+                <button
+                  key={r.key}
+                  type="button"
+                  onClick={() => setRange(r.key)}
+                  className={`rounded px-2.5 py-1 text-xs ${
+                    range === r.key
+                      ? "bg-emerald-700 text-white"
+                      : "border border-zinc-300 text-zinc-700 hover:bg-zinc-50"
+                  }`}
+                >
+                  {r.label}
+                </button>
+              ))}
+            </div>
           </div>
-          <div className="mt-4 overflow-x-auto">
+
+          <div className="mt-5 grid gap-6 lg:grid-cols-2">
+            <div>
+              <h3 className="mb-2 text-sm font-medium text-zinc-800">
+                Мощность
+              </h3>
+              <MetricsChart
+                labels={chartLabels}
+                unit="Вт"
+                series={[
+                  {
+                    label: "Power",
+                    values: points.map((p) => p.powerW),
+                    color: "#047857",
+                  },
+                ]}
+              />
+            </div>
+            <div>
+              <h3 className="mb-2 text-sm font-medium text-zinc-800">
+                Энергия
+              </h3>
+              <MetricsChart
+                labels={chartLabels}
+                unit="кВт·ч"
+                series={[
+                  {
+                    label: "Energy",
+                    values: points.map((p) => p.energyKwh),
+                    color: "#0f766e",
+                  },
+                ]}
+              />
+            </div>
+          </div>
+
+          <div className="mt-6 overflow-x-auto">
             <table className="w-full min-w-[480px] text-left text-sm">
               <thead className="border-b border-zinc-200 text-xs uppercase text-zinc-500">
                 <tr>
@@ -489,20 +625,23 @@ export function InvertersPanel({ adapters }: { adapters: AdapterInfo[] }) {
                 </tr>
               </thead>
               <tbody>
-                {[...points].reverse().slice(0, 40).map((p, i) => (
-                  <tr key={`${p.ts}-${i}`} className="border-b border-zinc-50">
-                    <td className="py-1.5 pr-3 text-zinc-600">
-                      {new Date(p.ts).toLocaleString("ru-RU")}
-                    </td>
-                    <td className="py-1.5 pr-3">{p.powerW ?? "—"}</td>
-                    <td className="py-1.5 pr-3">{p.energyKwh ?? "—"}</td>
-                    <td className="py-1.5">{p.soc ?? "—"}</td>
-                  </tr>
-                ))}
+                {[...points]
+                  .reverse()
+                  .slice(0, 50)
+                  .map((p, i) => (
+                    <tr key={`${p.ts}-${i}`} className="border-b border-zinc-50">
+                      <td className="py-1.5 pr-3 text-zinc-600">
+                        {new Date(p.ts).toLocaleString("ru-RU")}
+                      </td>
+                      <td className="py-1.5 pr-3">{p.powerW ?? "—"}</td>
+                      <td className="py-1.5 pr-3">{p.energyKwh ?? "—"}</td>
+                      <td className="py-1.5">{p.soc ?? "—"}</td>
+                    </tr>
+                  ))}
                 {!points.length && (
                   <tr>
-                    <td colSpan={4} className="py-3 text-zinc-500">
-                      Нет данных — нажмите Sync
+                    <td colSpan={4} className="py-4 text-center text-zinc-500">
+                      Нет точек — нажмите Sync или дождитесь worker
                     </td>
                   </tr>
                 )}

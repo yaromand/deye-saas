@@ -122,6 +122,22 @@ export async function pollInverter(
       finishedAt: new Date(),
     });
 
+    try {
+      const { evaluateAlertsAfterPoll } = await import("@/lib/telegram/alerts");
+      await evaluateAlertsAfterPoll({
+        inverterId,
+        tenantId,
+        status,
+        powerW: latest.powerW,
+        name: row.inverter.name,
+      });
+    } catch (err) {
+      console.warn(
+        "[poll] alert evaluation failed:",
+        err instanceof Error ? err.message : err,
+      );
+    }
+
     return {
       ok: true,
       stub,
