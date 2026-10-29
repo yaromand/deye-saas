@@ -1,10 +1,14 @@
 /**
- * Telegram worker stub — Phase 4 will send alerts/broadcasts.
+ * Telegram workers — deliver alerts and broadcasts to per-tenant bots.
  * Run via: npm run worker
  */
 import { Worker, type Job } from "bullmq";
 import Redis from "ioredis";
 import { QUEUE_BROADCAST, QUEUE_SEND_ALERT } from "../src/lib/queues";
+import {
+  deliverAlertEvent,
+  deliverBroadcast,
+} from "../src/lib/telegram/deliver";
 
 export type SendAlertJob = {
   alertEventId: string;
@@ -24,23 +28,37 @@ export function createTelegramWorkers(redisUrl = process.env.REDIS_URL) {
   const alertWorker = new Worker<SendAlertJob>(
     QUEUE_SEND_ALERT,
     async (job: Job<SendAlertJob>) => {
-      console.log(
-        `[telegram] stub send-alert ${job.id} event=${job.data.alertEventId}`,
+      const result = await deliverAlertEvent(
+        job.data.alertEventId,
+        job.data.tenantId,
       );
-      return { ok: true, stub: true };
+      console.log(
+        `[telegram] alert ${job.id} sent=${result.sent} err=${result.error ?? "-"}`,
+      );
+      if (result.error && result.sent === 0 && result.error !== "no_active_bot") {
+        throw new Error(result.error);
+      }
+      return result;
     },
-    { connection },
+    { connection, concurrency: 2 },
   );
 
   const broadcastWorker = new Worker<BroadcastJob>(
     QUEUE_BROADCAST,
     async (job: Job<BroadcastJob>) => {
-      console.log(
-        `[telegram] stub broadcast ${job.id} id=${job.data.broadcastId}`,
+      const result = await deliverBroadcast(
+        job.data.broadcastId,
+        job.data.tenantId,
       );
-      return { ok: true, stub: true };
+      console.log(
+        `[telegram] broadcast ${job.id} sent=${result.sent} err=${result.error ?? "-"}`,
+      );
+      if (result.error && result.sent === 0 && result.error !== "no_active_bot") {
+        throw new Error(result.error);
+      }
+      return result;
     },
-    { connection },
+    { connection, concurrency: 1 },
   );
 
   alertWorker.on("failed", (job, err) => {
